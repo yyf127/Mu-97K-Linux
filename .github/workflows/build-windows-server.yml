@@ -5,14 +5,13 @@ name: Windows Server
 # No reemplaza a server.yml: aquel valida PRs con dorny/paths-filter y no sube
 # artefacto. Este se dispara a mano (o al tocar server/) y siempre compila.
 #
-# Por qué no reutiliza server.yml:
+# Por que no reutiliza server.yml:
 #   - en workflow_dispatch, paths-filter no encuentra "server/**" cambiado y
-#     el job build queda salteado (salía sólo changes + result);
-#   - server.yml no tiene actions/upload-artifact, así que no hay .exe que bajar.
+#     el job build queda salteado (salia solo changes + result);
+#   - server.yml no tiene actions/upload-artifact, asi que no hay .exe que bajar.
 #
-# El paquete final incluye los .exe + MuServer/ (ini, DATA, SQL) + las DLL del
-# CRT dinámico que usan JoinServer/DataServer, para que sea un directorio que
-# se descomprime y arranca.
+# El paquete lo arma scripts/ci/package-windows.ps1: .exe + MuServer/ (ini,
+# DATA, SQL) + las DLL del CRT dinamico de JoinServer/DataServer.
 
 on:
   workflow_dispatch:
@@ -23,7 +22,7 @@ on:
         options: ["x64", "x86"]
         default: "x64"
       config:
-        description: "Configuración"
+        description: "Configuracion"
         type: choice
         options: ["Release", "Debug"]
         default: "Release"
@@ -31,6 +30,7 @@ on:
     branches: ["main", "fase/*"]
     paths:
       - "server/**"
+      - "scripts/ci/**"
       - ".github/workflows/build-windows-server.yml"
 
 permissions:
@@ -55,9 +55,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # El repo pesa ~330 MB por client/bin; acá sólo se compila server/.
+          # El repo pesa ~330 MB por client/bin; aca solo se compila server/.
           sparse-checkout: |
             server
+            scripts
             .github
           sparse-checkout-cone-mode: true
 
@@ -78,125 +79,8 @@ jobs:
         run: python -B tests/recall_packet_layout.py --architecture ${{ inputs.arch == 'x86' && 'Win32' || 'x64' }}
 
       - name: Reunir el paquete
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $bin   = "Source/MuServer/bin/$env:CFG"
-          $stage = Join-Path $env:GITHUB_WORKSPACE 'artifact'
-          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-
-          # 1) Configuración y datos de runtime que ya viven en el repo.
-          Copy-Item -Path 'MuServer/*' -Destination $stage -Recurse -Force
-
-          # 2) Ejecutables en su carpeta (la que espera el .ini al lado).
-          Copy-Item -LiteralPath "$bin/ConnectServer/ConnectServer.exe" -Destination "$stage/ConnectServer" -Force
-          Copy-Item -LiteralPath "$bin/GameServer/GameServer.exe"       -Destination "$stage/GameServer" -Force
-          Copy-Item -LiteralPath "$bin/MYSQL/JoinServer/JoinServer.exe"  -Destination "$stage/MySQL/JoinServer" -Force
-          Copy-Item -LiteralPath "$bin/MYSQL/DataServer/DataServer.exe"  -Destination "$stage/MySQL/DataServer" -Force
-
-          # 3) mu-data: con MSVC no tiene RUNTIME_OUTPUT_DIRECTORY propio, sale en
-          #    el árbol de build. Se busca en vez de suponer la ruta.
-          $preset = "$env:PRESET".ToLower()
-          $muData = Get-ChildItem -Path "out/build/$preset" -Recurse -Filter 'mu-data.exe' -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-          if (-not $muData) { throw 'mu-data.exe no apareció en out/build/' }
-          Copy-Item -LiteralPath $muData.FullName -Destination $stage -Force
-
-          # 4) CRT dinámico: JoinServer/DataServer son /MD (ver mu_add_server).
-          #    ConnectServer/GameServer/mu-data son /MT y no lo necesitan.
-          if ($env:CFG -eq 'Release') {
-            $dllRoot = if ($env:ARCH -eq 'x86') { Join-Path $env:WINDIR 'SysWOW64' } else { Join-Path $env:WINDIR 'System32' }
-            foreach ($dir in @("$stage/MySQL/JoinServer", "$stage/MySQL/DataServer")) {
-              foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
-                $srcDll = Join-Path $dllRoot $dll
-                if (Test-Path -LiteralPath $srcDll) { Copy-Item -LiteralPath $srcDll -Destination $dir -Force }
-              }
-            }
-          }
-
-          # 5) Script de configuración: versión y dirección del ServerList.
-          $fix = @'
-param(
-  [string]$Address = '127.0.0.1',
-  [int]$Port = 55901,
-  [string]$Version = '0.97.45'
-)
-$ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-$startup = Join-Path $root 'GameServer/DATA/GameServerInfo - StartUp.dat'
-$text = Get-Content -LiteralPath $startup -Raw
-$text = [regex]::Replace($text, '(?m)^ServerVersion\s*=.*$', "ServerVersion=$Version")
-Set-Content -LiteralPath $startup -Value $text -NoNewline -Encoding utf8
-
-$list = Join-Path $root 'ConnectServer/ServerList.dat'
-$lines = Get-Content -LiteralPath $list
-$new = foreach ($line in $lines) {
-  if ($line -match '^\s*\d+\s') {
-    $line = $line -replace '"[0-9]{1,3}(\.[0-9]{1,3}){3}"', ('"' + $Address + '"')
-    $line = $line -replace '(?<=\t)\d{4,5}(?=\t)', $Port.ToString()
-  }
-  $line
-}
-Set-Content -LiteralPath $list -Value $new -Encoding utf8
-
-Write-Host "ServerVersion=$Version  ServerList=${Address}:${Port}"
-'@
-          Set-Content -LiteralPath "$stage/fix-config.ps1" -Value $fix -Encoding utf8
-
-          # 6) Instrucciones.
-          $readme = @'
-MuServer 0.97.45 - Windows (artefacto de GitHub Actions)
-
-Contenido
-  ConnectServer/       ConnectServer.exe + ConnectServer.ini + ServerList.dat
-  GameServer/          GameServer.exe + DATA/ (TOML y .dat de configuración)
-  MySQL/JoinServer/    JoinServer.exe + JoinServer.ini
-  MySQL/DataServer/    DataServer.exe + DataServer.ini
-  MySQL/DB/            CreateDatabase.sql, PoblateDatabase.sql, ...
-  mu-data.exe          importar/comparar datos desde .txt/.dat
-  fix-config.ps1       ajusta ServerVersion y ServerList
-
-Puesta en marcha
-  1. Crear la base: MySQL/DB/CreateDatabase.sql y después PoblateDatabase.sql.
-  2. Revisar las credenciales de MySQL en MySQL/JoinServer/JoinServer.ini y
-     MySQL/DataServer/DataServer.ini.
-  3. .\fix-config.ps1 -Address 127.0.0.1   (o la IP pública)
-  4. Orden de arranque: DataServer -> JoinServer -> ConnectServer -> GameServer.
-  5. Puertos: 44405/TCP y 55601/UDP (ConnectServer), 55901/TCP (GameServer).
-     El firewall de Windows tiene que permitirlos.
-  6. La primera vez, GameServer genera Data/Keys/ServerIdentity.key; el
-     ConnectServer sólo lo lee. Se necesita el mismo archivo en los dos.
-
-Runtime de C
-  ConnectServer, GameServer y mu-data: CRT estático (/MT), no piden DLL.
-  JoinServer y DataServer: CRT dinámico (/MD); el paquete trae msvcp140.dll,
-  vcruntime140.dll y vcruntime140_1.dll al lado de cada .exe. Si Windows igual
-  los rechaza, instalar "Visual C++ 2015-2022 Redistributable".
-
-Notas
-  - No incluye mu-trace: ese target sólo existe en Linux (/dev/shm).
-  - ServerVersion=0.97.45 y protocolo 13 tienen que coincidir con el cliente.
-  - Debug se entrega sin DLL del CRT de depuración a propósito: es para probar
-    en la máquina de desarrollo, no para distribuir.
-'@
-          Set-Content -LiteralPath "$stage/README-ARTIFACT.txt" -Value $readme -Encoding utf8
-
-          # 7) Verificación dura: si falta un .exe, el job falla.
-          $must = @(
-            "$stage/ConnectServer/ConnectServer.exe",
-            "$stage/GameServer/GameServer.exe",
-            "$stage/MySQL/JoinServer/JoinServer.exe",
-            "$stage/MySQL/DataServer/DataServer.exe",
-            "$stage/mu-data.exe"
-          )
-          foreach ($p in $must) {
-            if (-not (Test-Path -LiteralPath $p)) { throw "Falta: $p" }
-            Write-Host ("OK  " + (Split-Path -Leaf $p) + "  " + [math]::Round((Get-Item -LiteralPath $p).Length / 1KB, 1) + " KB")
-          }
-          $total = (Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object Length -Sum).Sum
-          Write-Host ("Paquete: " + [math]::Round($total / 1MB, 1) + " MB")
+        working-directory: ${{ github.workspace }}
+        run: pwsh -NoProfile -File ./scripts/ci/package-windows.ps1 -Config $env:CFG -Arch $env:ARCH -Preset $env:PRESET -Workspace $env:GITHUB_WORKSPACE
 
       - name: Subir artefacto
         uses: actions/upload-artifact@v4
