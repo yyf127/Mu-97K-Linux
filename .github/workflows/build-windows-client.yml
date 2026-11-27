@@ -1,0 +1,69 @@
+# Compilación a demanda del cliente Windows (SDL3 + OpenGL, sin Dawn/vcpkg).
+#
+# El workflow `Client` compila x64 sólo con WebGPU (hereda windows-webgpu-base y
+# necesita vcpkg para Dawn, y la primera vez tarda decenas de minutos), y x86 sólo
+# con OpenGL. Este workflow cubre el hueco: x64 con OpenGL, que es lo que necesita
+# el árbol Content/ actual, y deja el exe como artefacto descargable.
+#
+# Configuración manual (no por preset) porque todos los presets de x64 heredan
+# windows-webgpu-base; MU_RENDER_WEBGPU queda OFF por defecto.
+name: Build Windows Client
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Arquitectura'
+        type: choice
+        options: [x64, x86]
+        default: x64
+      config:
+        description: 'Configuración'
+        type: choice
+        options: [Release, Debug]
+        default: Release
+permissions:
+  contents: read
+concurrency:
+  group: client-build-${{ github.ref }}-${{ inputs.arch }}
+  cancel-in-progress: true
+defaults:
+  run:
+    working-directory: client
+jobs:
+  build:
+    name: SDL3 ${{ inputs.arch }} ${{ inputs.config }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # El cliente no necesita Content/ ni server/ para compilar.
+          sparse-checkout: client
+      # SDL3, FreeType, HarfBuzz y SheenBidi bajan por FetchContent; sin caché
+      # cada corrida los vuelve a bajar.
+      - uses: actions/cache@v4
+        with:
+          path: client/build/ci/_deps
+          key: mu-deps-${{ runner.os }}-${{ inputs.arch }}-sdl3-ft-hb-sb
+      - name: Configurar
+        run: cmake -S . -B build/ci -A ${{ inputs.arch == 'x64' && 'x64' || 'Win32' }} -T v143 -DMU_PLATFORM_BACKEND=SDL3 -DMU_RENDER_WEBGPU=OFF
+      - name: Compilar
+        run: cmake --build build/ci --config ${{ inputs.config }} --target mu97k --parallel 4
+      # Un exe viejo (el que trae el repo en bin/Client) no sabe nada de
+      # Content/alias.toml ni de las capas: si falta alguno de estos literales,
+      # el artefacto no sirve y es mejor fallar acá.
+      - name: Verificar que el exe trae las capas de contenido
+        shell: pwsh
+        run: |
+          $exe = 'bin/Client/main.exe'
+          if (-not (Test-Path $exe)) { throw "no se generó $exe" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe).Path))
+          foreach ($needle in 'alias.toml', 'Capas', '127.0.0.1') {
+            if ($text -notmatch [regex]::Escape($needle)) { throw "el exe no contiene '$needle'" }
+          }
+          'main.exe {0:N0} bytes' -f (Get-Item $exe).Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-windows-${{ inputs.arch }}-${{ inputs.config }}
+          path: client/bin/Client/main.exe
+          if-no-files-found: error
+          retention-days: 30
